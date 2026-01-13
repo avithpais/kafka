@@ -1,0 +1,370 @@
+@RestController
+@RequestMapping("/kafka/admin")
+@Slf4j
+public class KafkaOffsetAdminController {
+
+    private final ConsumerFactory<String, String> consumerFactory;
+
+    public KafkaOffsetAdminController(ConsumerFactory<String, String> consumerFactory) {
+        this.consumerFactory = consumerFactory;
+    }
+
+    // Get current committed offsets
+    @GetMapping("/offsets/{consumerGroup}/{topic}")
+    public ResponseEntity<Map<String, Object>> getOffsets(
+            @PathVariable String consumerGroup,
+            @PathVariable String topic) {
+
+        try (Consumer<String, String> consumer = createConsumer(consumerGroup)) {
+            
+            // Get partitions for topic
+            List<PartitionInfo> partitionInfos = consumer.partitionsFor(topic);
+            List<TopicPartition> partitions = partitionInfos.stream()
+                .map(p -> new TopicPartition(topic, p.partition()))
+                .collect(Collectors.toList());
+
+            // Get committed offsets
+            List<Map<String, Object>> partitionOffsets = new ArrayList<>();
+            
+            for (TopicPartition tp : partitions) {
+                OffsetAndMetadata committed = consumer.committed(tp);
+                partitionOffsets.add(Map.of(
+                    "partition", tp.partition(),
+                    "committedOffset", committed != null ? committed.offset() : -1
+                ));
+            }
+
+            partitionOffsets.sort(Comparator.comparing(m -> (Integer) m.get("partition")));
+
+            return ResponseEntity.ok(Map.of(
+                "consumerGroup", consumerGroup,
+                "topic", topic,
+                "partitions", partitionOffsets
+            ));
+
+        } catch (Exception e) {
+            log.error("Failed to get offsets", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // Get lag
+    @GetMapping("/lag/{consumerGroup}/{topic}")
+    public ResponseEntity<Map<String, Object>> getLag(
+            @PathVariable String consumerGroup,
+            @PathVariable String topic) {
+
+        try (Consumer<String, String> consumer = createConsumer(consumerGroup)) {
+
+            List<PartitionInfo> partitionInfos = consumer.partitionsFor(topic);
+            List<TopicPartition> partitions = partitionInfos.stream()
+                .map(p -> new TopicPartition(topic, p.partition()))
+                .collect(Collectors.toList());
+
+            // Get end offsets
+            Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
+
+            List<Map<String, Object>> lagInfo = new ArrayList<>();
+
+            for (TopicPartition tp : partitions) {
+                OffsetAndMetadata committed = consumer.committed(tp);
+                long committedOffset = committed != null ? committed.offset() : 0;
+                long endOffset = endOffsets.get(tp);
+                
+                lagInfo.add(Map.of(
+                    "partition", tp.partition(),
+                    "committedOffset", committedOffset,
+                    "endOffset", endOffset,
+                    "lag", endOffset - committedOffset
+                ));
+            }
+
+            lagInfo.sort(Comparator.comparing(m -> (Integer) m.get("partition")));
+
+            long totalLag = lagInfo.stream()
+                .mapToLong(m -> (Long) m.get("lag"))
+                .sum();
+
+            return ResponseEntity.ok(Map.of(
+                "consumerGroup", consumerGroup,
+                "topic", topic,
+                "totalLag", totalLag,
+                "partitions", lagInfo
+            ));
+
+        } catch (Exception e) {
+            log.error("Failed to get lag", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // Reset single partition to specific offset
+    @PostMapping("/offsets/{consumerGroup}/{topic}/{partition}/{offset}")
+    public ResponseEntity<Map<String, Object>> resetOffset(
+            @PathVariable String consumerGroup,
+            @PathVariable String topic,
+            @PathVariable int partition,
+            @PathVariable long offset) {
+
+        try (Consumer<String, String> consumer = createConsumer(consumerGroup)) {
+
+            TopicPartition tp = new TopicPartition(topic, partition);
+
+            // Must assign partition before seeking
+            consumer.assign(Collections.singleton(tp));
+
+            // Seek to offset
+            consumer.seek(tp, offset);
+
+            // Commit the new offset
+            consumer.commitSync(Map.of(tp, new OffsetAndMetadata(offset)));
+
+            log.info("Reset offset for group {} topic {} partition {} to {}",
+                consumerGroup, topic, partition, offset);
+
+            return ResponseEntity.ok(Map.of(
+                "consumerGroup", consumerGroup,
+                "topic", topic,
+                "partition", partition,
+                "newOffset", offset,
+                "status", "success"
+            ));
+
+        } catch (Exception e) {
+            log.error("Failed to reset offset", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // Reset multiple partitions
+    @PostMapping("/offsets/{consumerGroup}/{topic}")
+    public ResponseEntity<Map<String, Object>> resetOffsets(
+            @PathVariable String consumerGroup,
+            @PathVariable String topic,
+            @RequestBody List<PartitionOffsetRequest> requests) {
+
+        try (Consumer<String, String> consumer = createConsumer(consumerGroup)) {
+
+            List<TopicPartition> partitions = requests.stream()
+                .map(r -> new TopicPartition(topic, r.getPartition()))
+                .collect(Collectors.toList());
+
+            consumer.assign(partitions);
+
+            Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();
+
+            for (PartitionOffsetRequest request : requests) {
+                TopicPartition tp = new TopicPartition(topic, request.getPartition());
+                consumer.seek(tp, request.getOffset());
+                offsetsToCommit.put(tp, new OffsetAndMetadata(request.getOffset()));
+            }
+
+            consumer.commitSync(offsetsToCommit);
+
+            log.info("Reset offsets for group {} topic {}: {}", consumerGroup, topic, requests);
+
+            return ResponseEntity.ok(Map.of(
+                "consumerGroup", consumerGroup,
+                "topic", topic,
+                "partitionsReset", requests,
+                "status", "success"
+            ));
+
+        } catch (Exception e) {
+            log.error("Failed to reset offsets", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // Reset all partitions to beginning
+    @PostMapping("/offsets/{consumerGroup}/{topic}/beginning")
+    public ResponseEntity<Map<String, Object>> resetToBeginning(
+            @PathVariable String consumerGroup,
+            @PathVariable String topic) {
+
+        try (Consumer<String, String> consumer = createConsumer(consumerGroup)) {
+
+            List<PartitionInfo> partitionInfos = consumer.partitionsFor(topic);
+            List<TopicPartition> partitions = partitionInfos.stream()
+                .map(p -> new TopicPartition(topic, p.partition()))
+                .collect(Collectors.toList());
+
+            consumer.assign(partitions);
+            consumer.seekToBeginning(partitions);
+
+            // Get the actual beginning offsets and commit
+            Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();
+            List<Map<String, Object>> resetPartitions = new ArrayList<>();
+
+            for (TopicPartition tp : partitions) {
+                long position = consumer.position(tp);
+                offsetsToCommit.put(tp, new OffsetAndMetadata(position));
+                resetPartitions.add(Map.of(
+                    "partition", tp.partition(),
+                    "newOffset", position
+                ));
+            }
+
+            consumer.commitSync(offsetsToCommit);
+
+            resetPartitions.sort(Comparator.comparing(m -> (Integer) m.get("partition")));
+
+            log.info("Reset all partitions to beginning for group {} topic {}", consumerGroup, topic);
+
+            return ResponseEntity.ok(Map.of(
+                "consumerGroup", consumerGroup,
+                "topic", topic,
+                "strategy", "beginning",
+                "partitionsReset", resetPartitions,
+                "status", "success"
+            ));
+
+        } catch (Exception e) {
+            log.error("Failed to reset to beginning", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // Reset all partitions to end
+    @PostMapping("/offsets/{consumerGroup}/{topic}/end")
+    public ResponseEntity<Map<String, Object>> resetToEnd(
+            @PathVariable String consumerGroup,
+            @PathVariable String topic) {
+
+        try (Consumer<String, String> consumer = createConsumer(consumerGroup)) {
+
+            List<PartitionInfo> partitionInfos = consumer.partitionsFor(topic);
+            List<TopicPartition> partitions = partitionInfos.stream()
+                .map(p -> new TopicPartition(topic, p.partition()))
+                .collect(Collectors.toList());
+
+            consumer.assign(partitions);
+            consumer.seekToEnd(partitions);
+
+            Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();
+            List<Map<String, Object>> resetPartitions = new ArrayList<>();
+
+            for (TopicPartition tp : partitions) {
+                long position = consumer.position(tp);
+                offsetsToCommit.put(tp, new OffsetAndMetadata(position));
+                resetPartitions.add(Map.of(
+                    "partition", tp.partition(),
+                    "newOffset", position
+                ));
+            }
+
+            consumer.commitSync(offsetsToCommit);
+
+            resetPartitions.sort(Comparator.comparing(m -> (Integer) m.get("partition")));
+
+            log.info("Reset all partitions to end for group {} topic {}", consumerGroup, topic);
+
+            return ResponseEntity.ok(Map.of(
+                "consumerGroup", consumerGroup,
+                "topic", topic,
+                "strategy", "end",
+                "partitionsReset", resetPartitions,
+                "status", "success"
+            ));
+
+        } catch (Exception e) {
+            log.error("Failed to reset to end", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // Reset all partitions to timestamp
+    @PostMapping("/offsets/{consumerGroup}/{topic}/timestamp/{timestamp}")
+    public ResponseEntity<Map<String, Object>> resetToTimestamp(
+            @PathVariable String consumerGroup,
+            @PathVariable String topic,
+            @PathVariable long timestamp) {
+
+        try (Consumer<String, String> consumer = createConsumer(consumerGroup)) {
+
+            List<PartitionInfo> partitionInfos = consumer.partitionsFor(topic);
+            List<TopicPartition> partitions = partitionInfos.stream()
+                .map(p -> new TopicPartition(topic, p.partition()))
+                .collect(Collectors.toList());
+
+            consumer.assign(partitions);
+
+            // Build timestamp query
+            Map<TopicPartition, Long> timestampQuery = partitions.stream()
+                .collect(Collectors.toMap(tp -> tp, tp -> timestamp));
+
+            // Get offsets for timestamp
+            Map<TopicPartition, OffsetAndTimestamp> offsetsForTimestamp = 
+                consumer.offsetsForTimes(timestampQuery);
+
+            Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();
+            List<Map<String, Object>> resetPartitions = new ArrayList<>();
+
+            for (TopicPartition tp : partitions) {
+                OffsetAndTimestamp offsetAndTimestamp = offsetsForTimestamp.get(tp);
+                
+                if (offsetAndTimestamp != null) {
+                    long offset = offsetAndTimestamp.offset();
+                    consumer.seek(tp, offset);
+                    offsetsToCommit.put(tp, new OffsetAndMetadata(offset));
+                    resetPartitions.add(Map.of(
+                        "partition", tp.partition(),
+                        "newOffset", offset,
+                        "timestamp", offsetAndTimestamp.timestamp()
+                    ));
+                } else {
+                    // No offset found for timestamp, seek to end
+                    consumer.seekToEnd(Collections.singleton(tp));
+                    long position = consumer.position(tp);
+                    offsetsToCommit.put(tp, new OffsetAndMetadata(position));
+                    resetPartitions.add(Map.of(
+                        "partition", tp.partition(),
+                        "newOffset", position,
+                        "note", "No offset for timestamp, seeked to end"
+                    ));
+                }
+            }
+
+            consumer.commitSync(offsetsToCommit);
+
+            resetPartitions.sort(Comparator.comparing(m -> (Integer) m.get("partition")));
+
+            log.info("Reset all partitions to timestamp {} for group {} topic {}",
+                timestamp, consumerGroup, topic);
+
+            return ResponseEntity.ok(Map.of(
+                "consumerGroup", consumerGroup,
+                "topic", topic,
+                "strategy", "timestamp",
+                "requestedTimestamp", timestamp,
+                "partitionsReset", resetPartitions,
+                "status", "success"
+            ));
+
+        } catch (Exception e) {
+            log.error("Failed to reset to timestamp", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // Create a temporary consumer for admin operations
+    private Consumer<String, String> createConsumer(String consumerGroup) {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, 
+            consumerFactory.getConfigurationProperties().get(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG));
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, consumerGroup);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+
+        return new KafkaConsumer<>(props);
+    }
+}
